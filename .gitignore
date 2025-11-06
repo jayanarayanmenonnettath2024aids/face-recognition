@@ -19,6 +19,7 @@ faces.ann
 # Model files (large files - add download instructions in README)
 *.caffemodel
 deploy.prototxt
+arcface_mobilenetv2.onnx
 
 # IDE
 .vscode/
