@@ -6,9 +6,7 @@ Single-file face recognition system:
 - Uses OpenCV DNN face detector (with auto-download of model files) or HaarCascade fallback
 - Uses an ONNX embedding model (ArcFace-like). You must provide path to an ONNX model (see notes)
 - Stores embeddings in SQLite and an Annoy index for fast lookup
-- CLI: add, recognize, list, export
-
-Author: ChatGPT (GPT-5 Thinking mini)
+- CLI: add, recognize, list, exportnoe
 Date: 2025-10-18
 """
 
@@ -34,12 +32,15 @@ DB_PATH = "faces.db"
 ANNOY_INDEX_PATH = "faces.ann"
 ANNOY_TREE_COUNT = 10         # rebuild trees when new faces added (small DB -> small value is OK)
 EMBEDDING_DIM = None         # will be inferred from ONNX model output
-SIMILARITY_THRESHOLD = 0.70  # cosine distance threshold (70% match required for recognition)
+SIMILARITY_THRESHOLD = 0.60  # cosine distance threshold (60% match required - balanced accuracy)
+MIN_FACE_SIZE = 80           # minimum face width/height in pixels to process
+TEMPORAL_FRAMES = 5          # number of consecutive frames to verify recognition
+MIN_FACE_AREA_RATIO = 0.02   # minimum face area as ratio of frame area
 FACE_DETECTOR_DNN_PROTOTXT = "deploy.prototxt"
 FACE_DETECTOR_DNN_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
 # URLs (auto-download) for OpenCV DNN face detector files (from OpenCV's GitHub)
 DNN_PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-DNN_MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/master/res10_300x300_ssd_iter_140000_fp16.caffemodel"
+DNN_MODEL_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 # ONNX model path - you must provide an ONNX face-embedding model suited for ArcFace/FaceNet.
 # Recommended: a lightweight ArcFace-Mobile or MobileFaceNet ONNX model (112x112 input). Put path or URL here.
 DEFAULT_ONNX_PATH = "arcface_mobilenetv2.onnx"
@@ -111,7 +112,7 @@ def ensure_dnn_detector_files():
 # Face Detector (OpenCV DNN with Haar fallback)
 # -----------------------------
 class FaceDetector:
-    def __init__(self, conf_threshold=0.6):
+    def __init__(self, conf_threshold=0.75):
         self.conf_threshold = conf_threshold
         self.net = None
         self.haar = None
@@ -131,8 +132,9 @@ class FaceDetector:
             print("[*] Using Haar Cascade face detector (fallback).")
 
     def detect(self, frame):
-        """Return list of boxes [x1,y1,x2,y2] in pixel coordinates"""
+        """Return list of boxes [x1,y1,x2,y2] in pixel coordinates with size filtering"""
         h, w = frame.shape[:2]
+        frame_area = h * w
         boxes = []
         if self.net:
             blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
@@ -147,12 +149,20 @@ class FaceDetector:
                     y2 = int(detections[0, 0, i, 6] * h)
                     # clip
                     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w - 1, x2), min(h - 1, y2)
-                    boxes.append([x1, y1, x2, y2])
+                    
+                    # Filter by minimum size and area ratio
+                    face_w, face_h = x2 - x1, y2 - y1
+                    face_area = face_w * face_h
+                    if face_w >= MIN_FACE_SIZE and face_h >= MIN_FACE_SIZE:
+                        if face_area / frame_area >= MIN_FACE_AREA_RATIO:
+                            boxes.append([x1, y1, x2, y2])
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            rects = self.haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40,40))
+            rects = self.haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(MIN_FACE_SIZE, MIN_FACE_SIZE))
             for (x, y, rw, rh) in rects:
-                boxes.append([x, y, x + rw, y + rh])
+                face_area = rw * rh
+                if face_area / frame_area >= MIN_FACE_AREA_RATIO:
+                    boxes.append([x, y, x + rw, y + rh])
         return boxes
 
 # -----------------------------
@@ -184,13 +194,21 @@ class ONNXEmbedder:
         # Model expects (1,H,W,C) = (1,112,112,3)
         h, w, c = self.input_shape[1], self.input_shape[2], self.input_shape[3]  # 112,112,3
         
-        # Apply histogram equalization for better image quality
-        face_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-        face_eq = cv2.equalizeHist(face_gray)
-        face_bgr = cv2.cvtColor(face_eq, cv2.COLOR_GRAY2BGR)
+        # Enhanced lighting normalization using CLAHE (better for varied lighting)
+        # Convert to LAB color space for better lighting handling
+        lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l_clahe = clahe.apply(l)
+        
+        # Merge back and convert to BGR
+        lab_clahe = cv2.merge([l_clahe, a, b])
+        face_bgr_enhanced = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         
         # Use high-quality interpolation for better resizing
-        face = cv2.resize(face_bgr, (w, h), interpolation=cv2.INTER_CUBIC)
+        face = cv2.resize(face_bgr_enhanced, (w, h), interpolation=cv2.INTER_CUBIC)
         rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB).astype(np.float32)
         rgb = (rgb - 127.5) / 128.0
         tensor = rgb[None, :, :, :].astype(np.float32)  # (1, H, W, C)
@@ -208,28 +226,45 @@ class ONNXEmbedder:
             vec = vec / norm
         return vec
     
-    def is_good_quality_face(self, face_bgr, min_size=60):
-        """Check if the face is of sufficient quality for recognition"""
+    def is_good_quality_face(self, face_bgr, min_size=80):
+        """Check if the face is of sufficient quality for recognition with enhanced checks"""
         if face_bgr is None or face_bgr.size == 0:
             return False
         
         h, w = face_bgr.shape[:2]
         
-        # Check minimum size
+        # Check minimum size - increased threshold
         if h < min_size or w < min_size:
             return False
         
-        # Check if face is too blurry using Laplacian variance
         gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         
-        # Threshold for blur detection (adjust as needed)
-        if laplacian_var < 100:
+        # Enhanced blur detection using Laplacian variance
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < 100:  # Stricter blur threshold
             return False
         
-        # Check brightness (avoid too dark faces)
+        # Additional blur check using gradient magnitude
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(gx**2 + gy**2).mean()
+        if gradient_magnitude < 15:  # Low gradient means blurry
+            return False
+        
+        # Check brightness with acceptable range
         mean_brightness = np.mean(gray)
         if mean_brightness < 30 or mean_brightness > 225:
+            return False
+        
+        # Check contrast - reject low contrast images
+        contrast = gray.std()
+        if contrast < 20:  # Low contrast
+            return False
+        
+        # Edge density check - good faces should have clear edges
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        if edge_density < 0.05 or edge_density > 0.4:  # Too few or too many edges
             return False
             
         return True
@@ -621,8 +656,12 @@ def recognize_flow(args, embedder, detector):
     pause_duration = 5.0  # seconds
     unlocked_person = None
     
-    print("[*] Starting recognition with 70% threshold. Press 'q' to quit.")
+    # Temporal smoothing - track recognition history
+    recognition_history = []  # List of (name, confidence) tuples
+    
+    print(f"[*] Starting recognition with {int(SIMILARITY_THRESHOLD*100)}% threshold. Press 'q' to quit.")
     print("[*] System will pause for 5 seconds after recognizing a person.")
+    print(f"[*] Enhanced detection: min face size={MIN_FACE_SIZE}px, temporal frames={TEMPORAL_FRAMES}")
     
     while True:
         ret, frame = cam.read()
@@ -649,6 +688,8 @@ def recognize_flow(args, embedder, detector):
             
         boxes = detector.detect(frame)
         recognition_made = False
+        best_match_this_frame = None
+        best_match_confidence = 0
         
         for b in boxes:
             x1,y1,x2,y2 = b
@@ -678,20 +719,22 @@ def recognize_flow(args, embedder, detector):
                     best_sim = cos
                     best = db_id
                     best_name = cand_name
+            
+            # Show similarity percentage even when not recognized (for debugging)
+            if best_name and best_sim > 0:
+                print(f"[DEBUG] Best match: {best_name} with {best_sim*100:.1f}% confidence")
+            
+            # Track best match for temporal smoothing
+            if best_name and best_sim >= SIMILARITY_THRESHOLD:
+                if best_sim > best_match_confidence:
+                    best_match_this_frame = best_name
+                    best_match_confidence = best_sim
                     
-            # Check if similarity meets the 70% threshold
+            # Check if similarity meets the threshold
             if best is not None and best_sim >= SIMILARITY_THRESHOLD:
                 label = f"{best_name} ({best_sim*100:.1f}%)"
                 box_color = (0, 255, 0)  # Green for recognized
                 text_color = (0, 255, 0)
-                
-                # Trigger the unlock sequence
-                if not recognition_made:  # Only trigger once per frame
-                    last_recognition_time = current_time
-                    unlocked_person = best_name
-                    recognition_made = True
-                    print(f"[+] UNLOCKED: {best_name} recognized with {best_sim*100:.1f}% confidence")
-                    
             else:
                 label = f"Unknown ({best_sim*100:.1f}%)" if best_sim > 0 else "Unknown"
                 box_color = (0, 0, 255)  # Red for unknown
@@ -700,6 +743,37 @@ def recognize_flow(args, embedder, detector):
             # annotate
             cv2.rectangle(frame, (x1,y1), (x2,y2), box_color, 2)
             cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+        
+        # Temporal smoothing: add current frame result to history
+        if best_match_this_frame:
+            recognition_history.append((best_match_this_frame, best_match_confidence))
+        else:
+            recognition_history.append((None, 0))
+        
+        # Keep only last TEMPORAL_FRAMES frames
+        if len(recognition_history) > TEMPORAL_FRAMES:
+            recognition_history.pop(0)
+        
+        # Check if we have consistent recognition over multiple frames
+        if len(recognition_history) >= TEMPORAL_FRAMES:
+            # Count occurrences of each person
+            person_counts = {}
+            for person, conf in recognition_history:
+                if person:
+                    person_counts[person] = person_counts.get(person, 0) + 1
+            
+            # Check if any person appears in majority of recent frames
+            for person, count in person_counts.items():
+                if count >= (TEMPORAL_FRAMES * 0.6):  # 60% of frames
+                    # Trigger unlock only if not already unlocked
+                    if not recognition_made and unlocked_person != person:
+                        last_recognition_time = current_time
+                        unlocked_person = person
+                        recognition_made = True
+                        avg_confidence = np.mean([c for p, c in recognition_history if p == person])
+                        print(f"[+] UNLOCKED: {person} recognized with {avg_confidence*100:.1f}% avg confidence (verified {count}/{TEMPORAL_FRAMES} frames)")
+                        recognition_history = []  # Reset history after unlock
+                        break
             
         # Display system status
         status_text = f"Threshold: {SIMILARITY_THRESHOLD*100:.0f}% | Faces in DB: {len(embeddings)}"
@@ -744,7 +818,7 @@ def main():
 
     # load embedder & detector with higher confidence threshold for better accuracy
     embedder = ONNXEmbedder(args.model)
-    detector = FaceDetector(conf_threshold=0.7)
+    detector = FaceDetector(conf_threshold=0.75)
 
     if args.cmd == "add":
         add_face_flow(args, embedder, detector)
